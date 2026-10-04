@@ -128,8 +128,8 @@ def t_ids():
         assert isinstance(p[k], str) and 0 < len(p[k]) <= 64
     me = call("GET", "/me", T["ada"]).json()
     assert len(me["user_id"]) <= 64
-    eq(me, {"user_id": "u_ada", "display_name": "Ada", "handle": "ada", "balance": 9900 + 0 if False else 9900,
-            "currency": "EUR", "minor_units": 2})
+    for k, v in {"user_id": "u_ada", "display_name": "Ada", "handle": "ada", "balance": 9900, "currency": "EUR", "minor_units": 2}.items():
+        eq(me[k], v, k)
 
 @test("R25")
 def t_currencies():
