@@ -520,12 +520,163 @@ def do_activity(user, query):
     return 200, {"payments": out[:limit], "has_more": len(out) > limit}
 
 
+def request_view(r):
+    users = STATE["users"]
+    return {
+        "request_id": r["id"],
+        "requester_id": r["requester_id"],
+        "requester_handle": users[r["requester_id"]]["handle"],
+        "payer_id": r["payer_id"],
+        "payer_handle": users[r["payer_id"]]["handle"],
+        "amount": r["amount"],
+        "currency": STATE["currency"],
+        "note": r["note"],
+        "status": r["status"],
+        "payment_id": r["payment_id"],
+        "created_at": r["created_at"],
+    }
+
+
+def new_request(requester, payer, amount, note, split_id=None, created_at=None):
+    st = STATE
+    st["counters"]["seq"] += 1
+    r = {
+        "id": next_id("rq", "request", lambda i: i in st["requests"]),
+        "requester_id": requester["id"], "payer_id": payer["id"], "amount": amount,
+        "note": note, "status": "pending", "payment_id": None, "split_id": split_id,
+        "created_at": created_at or now_iso(), "seq": st["counters"]["seq"],
+    }
+    st["requests"][r["id"]] = r
+    return r
+
+
+def do_request(user, body):
+    payer_handle = require_str(body, "payer_handle")
+    if "amount" not in body:
+        bad("amount is required")
+    amount = parse_amount(body["amount"])
+    note = parse_note(body)
+    if payer_handle == user["handle"]:
+        raise ApiError(422, "self_request", "cannot request from yourself")
+    payer = user_by_handle(payer_handle)
+    if payer is None:
+        raise ApiError(404, "not_found", "no such handle")
+    return request_view(new_request(user, payer, amount, note))
+
+
+def get_request_for(rid):
+    r = STATE["requests"].get(rid)
+    if r is None:
+        raise ApiError(404, "not_found", "no such request")
+    return r
+
+
+def do_pay(user, body, rid):
+    r = get_request_for(rid)
+    if r["payer_id"] != user["id"]:
+        raise ApiError(403, "forbidden", "only the payer may pay")
+    vis = parse_visibility(body)
+    if r["status"] != "pending":
+        raise ApiError(409, "request_not_pending")
+    if user["balance"] < r["amount"]:
+        raise ApiError(409, "insufficient_funds")
+    requester = STATE["users"][r["requester_id"]]
+    p = make_payment(user, requester, r["amount"], r["note"], vis, request_id=r["id"])
+    r["status"] = "paid"
+    r["payment_id"] = p["id"]
+    return payment_view(p)
+
+
+def do_decline_cancel(user, rid, action):
+    r = get_request_for(rid)
+    party, target = (("payer_id", "declined") if action == "decline"
+                     else ("requester_id", "cancelled"))
+    if r[party] != user["id"]:
+        raise ApiError(403, "forbidden", f"only the {party[:-3]} may {action}")
+    if r["status"] == target:
+        return 200, request_view(r)
+    if r["status"] != "pending":
+        raise ApiError(409, "request_not_pending")
+    r["status"] = target
+    return 200, request_view(r)
+
+
+def do_requests(user, query):
+    limit, offset = parse_paging(query)
+    direction = (query.get("direction") or [None])[-1]
+    status = (query.get("status") or [None])[-1]
+    if direction is not None and direction not in ("incoming", "outgoing"):
+        bad("unknown direction")
+    if status is not None and status not in STATUSES:
+        bad("unknown status")
+    uid = user["id"]
+    out, skipped = [], 0
+    for r in sorted(STATE["requests"].values(), key=lambda x: x["seq"], reverse=True):
+        mine_in, mine_out = r["payer_id"] == uid, r["requester_id"] == uid
+        if direction == "incoming" and not mine_in:
+            continue
+        if direction == "outgoing" and not mine_out:
+            continue
+        if not (mine_in or mine_out) or (status and r["status"] != status):
+            continue
+        if skipped < offset:
+            skipped += 1
+            continue
+        out.append(request_view(r))
+        if len(out) > limit:
+            break
+    return 200, {"requests": out[:limit], "has_more": len(out) > limit}
+
+
+def equal_shares(amount, n):
+    base, extra = divmod(amount, n)
+    return [base + (1 if i < extra else 0) for i in range(n)]
+
+
+def do_split(user, body):
+    if "amount" not in body:
+        bad("amount is required")
+    amount = parse_amount(body["amount"])
+    if "participant_handles" not in body:
+        bad("participant_handles is required")
+    handles = body["participant_handles"]
+    if not isinstance(handles, list) or not all(isinstance(h, str) for h in handles):
+        raise ApiError(400, "malformed_request", "participant_handles must be a list of strings")
+    if not handles or len(set(handles)) != len(handles):
+        bad("participant_handles must be non-empty and unique")
+    note = parse_note(body)
+    people = []
+    for h in handles:
+        u = user_by_handle(h)
+        if u is None:
+            raise ApiError(404, "not_found", f"no such handle {h}")
+        people.append(u)
+    st = STATE
+    now = now_iso()
+    amounts = equal_shares(amount, len(people))
+    split_id = next_id("sp", "split", lambda i: i in st["splits"])
+    reqs = [request_view(new_request(user, u, a, note, split_id, now))
+            for u, a in zip(people, amounts) if u["id"] != user["id"]]
+    resp = {
+        "split_id": split_id, "amount": amount, "currency": st["currency"], "note": note,
+        "shares": [{"handle": u["handle"], "amount": a} for u, a in zip(people, amounts)],
+        "requests": reqs, "created_at": now,
+    }
+    st["splits"][split_id] = {"id": split_id, "user_id": user["id"],
+                              "request_ids": [r["request_id"] for r in reqs],
+                              "created_at": now}
+    return resp
+
+
 # ---------------------------------------------------------------- http
 
 # (method, path) -> (needs idempotency, handler(user, body))
 IDEMPOTENT_ROUTES = {
     ("POST", "/payments"): do_payment,
+    ("POST", "/requests"): do_request,
+    ("POST", "/splits"): do_split,
 }
+REQ_ACTION_RE = re.compile(r"^/requests/([^/]+)/(pay|decline|cancel)$")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -635,22 +786,33 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(*do_login(self.obj(raw)))
 
         route = (method, path)
-        known = route in IDEMPOTENT_ROUTES or route in (("GET", "/me"), ("GET", "/activity"))
+        handler = IDEMPOTENT_ROUTES.get(route)
+        m = REQ_ACTION_RE.match(path) if method == "POST" else None
+        if m:
+            rid, action = m.group(1), m.group(2)
+            if action == "pay":
+                handler = lambda user, body, _rid=rid: do_pay(user, body, _rid)
+            else:
+                with LOCK:
+                    user = self.authenticate()
+                    result = do_decline_cancel(user, rid, action)
+                return self.send_json(*result)
+        known = handler is not None or route in (
+            ("GET", "/me"), ("GET", "/activity"), ("GET", "/requests"))
         if not known:
             raise ApiError(404, "not_found", "no such route")
 
-        if route in IDEMPOTENT_ROUTES:
+        if handler is not None:
             with LOCK:
                 user = self.authenticate()
                 key = self.headers.get("Idempotency-Key")
                 if key is None or key == "":
                     raise ApiError(400, "missing_idempotency_key", "Idempotency-Key header required")
-                body = self.parse_json(raw)
+                body = self.parse_json(raw, allow_empty=path.endswith("/pay"))
                 if not isinstance(body, dict):
                     raise ApiError(400, "malformed_request", "body must be a JSON object")
                 if len(key) > 255:
                     raise ApiError(422, "validation_failed", "Idempotency-Key too long")
-                handler = IDEMPOTENT_ROUTES[route]
                 status, resp = idempotent(user, method, path, key, body,
                                           lambda: handler(user, body))
             return self.send_json(status, resp)
@@ -659,6 +821,8 @@ class Handler(BaseHTTPRequestHandler):
             user = self.authenticate()
             if route == ("GET", "/me"):
                 result = do_me(user)
+            elif route == ("GET", "/requests"):
+                result = do_requests(user, query)
             else:
                 result = do_activity(user, query)
         return self.send_json(*result)
