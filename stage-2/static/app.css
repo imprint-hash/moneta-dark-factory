@@ -163,3 +163,15 @@ ul.list{list-style:none;margin:0;padding:0;display:grid;gap:10px}
 .authcard .brand{justify-content:center;margin-bottom:18px;font-size:22px}
 .authcard .alt{text-align:center;margin-top:14px;color:var(--muted);font-size:14.5px}
 .tiny{font-size:13px;color:var(--muted)}
+[aria-live]:empty{display:none}
+
+.ghost{white-space:nowrap}
+.who{flex:1 1 auto;justify-content:flex-end}
+.who .names b{max-width:none}
+.item .meta .friendly{color:#cdd6f6}
+@media (max-width:560px){
+  .brand .bt{display:none}
+  .top{gap:8px;padding:10px 12px}
+  .who{justify-content:flex-start}
+  .top .ghost{padding:8px 12px;flex:none}
+}

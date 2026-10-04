@@ -97,6 +97,17 @@
     if (!(n >= 1)) return { error: 'Amount must be greater than zero.' };
     return { minor: n };
   }
+  function friendlyExpiry(a) {
+    const d = new Date(a.expires_at);
+    if (isNaN(d)) return '';
+    const on = d.toLocaleDateString([], { day: 'numeric', month: 'short' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (a.status !== 'open') return (a.status === 'expired' ? 'Expired ' : 'Was due ') + on;
+    const mins = Math.round((d - Date.now()) / 60000);
+    if (mins < 1) return 'Expires in under a minute \u00b7 ' + on;
+    if (mins < 90) return 'Expires in ' + mins + ' min \u00b7 ' + on;
+    if (mins < 2880) return 'Expires in ' + Math.round(mins / 60) + ' h \u00b7 ' + on;
+    return 'Expires on ' + on;
+  }
   function when(iso) {
     const d = new Date(iso);
     if (isNaN(d)) return iso;
@@ -220,7 +231,7 @@
     }
     const side = h('div', { class: 'side' },
       h('div', { class: 'top' },
-        h('div', { class: 'brand' }, h('span', { class: 'mark' }, svg('<path d="M5 12h14M12 5v14"/>')), 'Pocketful'),
+        h('div', { class: 'brand' }, h('span', { class: 'mark' }, svg('<path d="M5 12h14M12 5v14"/>')), h('span', { class: 'bt', text: 'Pocketful' })),
         h('div', { class: 'who' }, avatar(ME.display_name),
           h('div', { class: 'names' }, h('b', { tid: 'current-user', text: ME.display_name }),
             h('span', {}, '@', h('span', { tid: 'current-handle', text: ME.handle })))),
@@ -380,9 +391,7 @@
     }, done);
     const auth = moneyForm(authorizeCfg(), done);
 
-    const refresh = h('button', { type: 'button', class: 'ghost', tid: 'wallet-refresh', onclick: async (e) => {
-      e.currentTarget.disabled = true; await refreshHome(parts); e.currentTarget.disabled = false;
-    } }, 'Refresh');
+    const refresh = h('button', { type: 'button', class: 'ghost', tid: 'wallet-refresh', onclick: () => refreshHome(parts) }, 'Refresh');
     shell(h('div', { class: 'stack' },
       h('div', { class: 'sect' }, h('h1', { class: 'page-title', style: 'margin:0', text: 'Hi, ' + ME.display_name }), refresh),
       parts.wallet,
@@ -581,7 +590,7 @@
               h('span', { class: 'chip ' + a.visibility, text: a.visibility === 'private' ? 'Private' : 'Public' }),
               a.status === 'captured' ? h('span', {}, 'Collected ', h('b', { tid: 'authorization-captured-' + id, text: money(a.captured_amount) })) : null,
               a.status === 'open' && a.captured_amount > 0 ? h('span', { text: 'Collected so far ' + money(a.captured_amount) }) : null),
-            h('div', { class: 'meta' }, h('span', {}, 'Expires ', h('time', { tid: 'authorization-expires-' + id, datetime: a.expires_at, text: a.expires_at })))),
+            h('div', { class: 'meta' }, h('span', { class: 'friendly', text: friendlyExpiry(a) }), h('span', { class: 'tiny' }, h('time', { tid: 'authorization-expires-' + id, datetime: a.expires_at, text: a.expires_at })))),
           h('div', { class: 'amt ' + (incoming ? 'in' : 'out') }, h('span', { tid: 'authorization-amount-' + id, text: money(a.amount) })),
           ctl.length ? h('div', { class: 'actions' }, ctl) : null);
       })));
