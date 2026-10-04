@@ -668,6 +668,44 @@ def do_split(user, body):
     return resp
 
 
+def do_settlement(user, body):
+    transfers = body.get("transfers")
+    if not isinstance(transfers, list) or not 1 <= len(transfers) <= 32:
+        bad("transfers must be a list of 1 to 32 objects")
+    if not all(isinstance(t, dict) for t in transfers):
+        bad("each transfer must be an object")
+    entries = []
+    for t in transfers:
+        fh, th = t.get("from_handle"), t.get("to_handle")
+        if not isinstance(fh, str) or not isinstance(th, str) or "amount" not in t:
+            bad("transfer needs from_handle, to_handle and amount")
+        amount = parse_amount(t["amount"])
+        note = parse_note(t)
+        vis = parse_visibility(t)
+        if fh == th:
+            raise ApiError(422, "self_payment", "cannot transfer to the same wallet")
+        frm, to = user_by_handle(fh), user_by_handle(th)
+        if frm is None or to is None:
+            raise ApiError(404, "not_found", "no such handle")
+        entries.append((frm, to, amount, note, vis))
+    net = {}
+    for frm, to, amount, _, _ in entries:
+        net[frm["id"]] = net.get(frm["id"], 0) - amount
+        net[to["id"]] = net.get(to["id"], 0) + amount
+    for uid, delta in net.items():
+        if STATE["users"][uid]["balance"] + delta < 0:
+            raise ApiError(409, "insufficient_funds", "settlement is not affordable")
+    st = STATE
+    committed = now_iso()
+    sid = next_id("st", "settlement", lambda i: i in st["settlements"])
+    payments = [make_payment(f, t, a, n, v, settlement_id=sid, created_at=committed)
+                for f, t, a, n, v in entries]
+    st["settlements"][sid] = {"id": sid, "user_id": user["id"], "committed_at": committed,
+                              "payment_ids": [p["id"] for p in payments]}
+    return {"settlement_id": sid, "committed_at": committed,
+            "payments": [payment_view(p) for p in payments]}
+
+
 # ---------------------------------------------------------------- http
 
 # (method, path) -> (needs idempotency, handler(user, body))
@@ -675,6 +713,7 @@ IDEMPOTENT_ROUTES = {
     ("POST", "/payments"): do_payment,
     ("POST", "/requests"): do_request,
     ("POST", "/splits"): do_split,
+    ("POST", "/settlements"): do_settlement,
 }
 REQ_ACTION_RE = re.compile(r"^/requests/([^/]+)/(pay|decline|cancel)$")
 
@@ -805,6 +844,8 @@ class Handler(BaseHTTPRequestHandler):
         if handler is not None:
             with LOCK:
                 user = self.authenticate()
+                if route == ("POST", "/settlements") and user["id"] not in STATE["operators"]:
+                    raise ApiError(403, "forbidden", "settlement operator required")
                 key = self.headers.get("Idempotency-Key")
                 if key is None or key == "":
                     raise ApiError(400, "missing_idempotency_key", "Idempotency-Key header required")
