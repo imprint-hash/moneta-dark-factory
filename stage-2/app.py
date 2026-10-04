@@ -948,12 +948,21 @@ AUTH_ACTION_RE = re.compile(r"^/authorizations/([^/]+)/(capture|void)$")
 UI_PATHS = ("/", "/requests", "/split", "/signup", "/login", "/authorizations")
 
 
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+STATIC_TYPES = {"app.html": "text/html; charset=utf-8", "app.css": "text/css; charset=utf-8",
+                "app.js": "application/javascript; charset=utf-8"}
+ASSETS = {}
+
+
+def asset(name):
+    if name not in ASSETS:
+        with open(os.path.join(STATIC_DIR, name), "rb") as f:
+            ASSETS[name] = f.read()
+    return ASSETS[name]
+
+
 def render_page(path):
-    """Placeholder shell; the real screens arrive with the UI work item."""
-    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-            "<title>Pocketful</title></head><body><main id=\"app\" data-route=\"%s\">"
-            "Pocketful</main></body></html>" % path)
+    return asset("app.html").decode("utf-8")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -979,6 +988,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -1072,6 +1082,14 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/auth/login":
             return self.send_json(*do_login(self.obj(raw)))
 
+        if method == "GET" and path.startswith("/static/") and path[8:] in STATIC_TYPES:
+            body = asset(path[8:])
+            self.send_response(200)
+            self.send_header("Content-Type", STATIC_TYPES[path[8:]])
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return self.wfile.write(body)
         if method == "GET" and path in UI_PATHS and (
                 path == "/" or "text/html" in (self.headers.get("Accept") or "").lower()):
             return self.send_html(render_page(path))
