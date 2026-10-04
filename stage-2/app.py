@@ -25,6 +25,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+$")
 DIGITS_RE = re.compile(r"^[0-9]+$")
 STATUSES = ("pending", "paid", "declined", "cancelled")
 VISIBILITIES = ("public", "private")
+AUTH_STATUSES = ("open", "captured", "voided", "expired")
 
 LOCK = threading.RLock()
 STATE: dict = {}
@@ -157,8 +158,9 @@ def empty_state(currency="EUR", minor_units=2):
         "currency": currency, "minor_units": minor_units,
         "users": {}, "tokens": {}, "payments": [], "requests": {}, "splits": {},
         "settlements": {}, "idem": {}, "operators": [],
+        "ttl": 600, "authorizations": {},
         "counters": {"payment": 0, "request": 0, "split": 0, "settlement": 0,
-                     "user": 0, "seq": 0},
+                     "user": 0, "seq": 0, "authorization": 0},
     }
 
 
@@ -221,7 +223,12 @@ def state_from_fixture(fx) -> dict:
     if mu not in (0, 2, 3):
         bad("minor_units must be 0, 2 or 3")
     st = empty_state(currency, mu)
-    for key in ("users", "payments", "requests", "settlement_operator_ids"):
+    if "authorization_ttl_seconds" in fx:
+        ttl = as_integral(fx["authorization_ttl_seconds"])
+        if ttl is None or ttl < 1:
+            bad("authorization_ttl_seconds must be a positive integer")
+        st["ttl"] = ttl
+    for key in ("users", "payments", "requests", "settlement_operator_ids", "authorizations"):
         if key in fx and fx[key] is not None and not isinstance(fx[key], list):
             bad(f"{key} must be a list")
     seen_email, seen_handle = set(), set()
@@ -302,6 +309,51 @@ def state_from_fixture(fx) -> dict:
             "note": note, "status": status, "payment_id": pay_id,
             "split_id": None, "created_at": created, "seq": st["counters"]["seq"],
         }
+    now_dt = datetime.now(timezone.utc)
+    for raw in fx.get("authorizations") or []:
+        if not isinstance(raw, dict):
+            bad("authorization must be an object")
+        aid = need_str(raw, "id", "authorization")
+        if not aid or len(aid) > 64 or aid in st["authorizations"]:
+            bad("authorization id invalid or duplicated")
+        frm, to = need_str(raw, "from_user_id", "authorization"), need_str(raw, "to_user_id", "authorization")
+        if frm not in st["users"] or to not in st["users"] or frm == to:
+            bad("authorization references unknown user")
+        amount = as_integral(raw.get("amount"))
+        if amount is None or amount < 1:
+            bad("authorization amount invalid")
+        note = raw.get("note", "")
+        vis = raw.get("visibility", "public")
+        status = raw.get("status", "open")
+        if not isinstance(note, str) or vis not in VISIBILITIES or status not in AUTH_STATUSES:
+            bad("authorization note/visibility/status invalid")
+        expires = parse_ts(raw.get("expires_at"), "expires_at")
+        if expires is None:
+            bad("authorization expires_at is required")
+        cap = as_integral(raw.get("captured_amount", amount if status == "captured" else 0))
+        if cap is None or cap < 0 or cap > amount:
+            bad("authorization captured_amount invalid")
+        pids = raw.get("payment_ids") or []
+        if not isinstance(pids, list) or not all(isinstance(x, str) for x in pids):
+            bad("authorization payment_ids invalid")
+        created = parse_ts(raw.get("created_at"), "created_at") or now_iso(base + timedelta(seconds=tick))
+        tick += 1
+        if status == "open" and datetime.fromisoformat(expires) <= now_dt:
+            status = "expired"
+        st["counters"]["seq"] += 1
+        st["authorizations"][aid] = {
+            "id": aid, "from_user_id": frm, "to_user_id": to, "amount": amount,
+            "captured_amount": cap, "note": note, "visibility": vis, "status": status,
+            "expires_at": expires, "payment_ids": pids, "created_at": created,
+            "seq": st["counters"]["seq"],
+        }
+    holds = {}
+    for a in st["authorizations"].values():
+        if a["status"] == "open":
+            holds[a["from_user_id"]] = holds.get(a["from_user_id"], 0) + a["amount"] - a["captured_amount"]
+    for uid, h in holds.items():
+        if h > st["users"][uid]["balance"]:
+            bad("seeded holds exceed balance")
     ops = fx.get("settlement_operator_ids") or []
     if not all(isinstance(o, str) for o in ops):
         bad("settlement_operator_ids must be strings")
@@ -314,6 +366,11 @@ def state_from_export(state) -> dict:
     if not isinstance(state, dict):
         bad("state must be an object")
     s = copy.deepcopy(state)
+    if isinstance(s, dict) and isinstance(s.get("counters"), dict):
+        s["counters"].setdefault("authorization", 0)
+    if isinstance(s, dict):
+        s.setdefault("ttl", 600)
+        s.setdefault("authorizations", {})
     try:
         cur = s["currency"]
         if not isinstance(cur, str) or as_integral(s["minor_units"]) not in (0, 2, 3):
@@ -367,6 +424,25 @@ def state_from_export(state) -> dict:
                 bad("idempotency record invalid")
         if not all(isinstance(o, str) for o in s["operators"]):
             bad("operators invalid")
+        ttl = as_integral(s["ttl"])
+        if ttl is None or ttl < 1 or not isinstance(s["authorizations"], dict):
+            bad("authorization settings invalid")
+        holds = {}
+        for aid, a in s["authorizations"].items():
+            if not isinstance(a, dict) or a.get("id") != aid:
+                bad("authorization invalid")
+            for k in ("from_user_id", "to_user_id", "expires_at", "created_at", "note"):
+                need_str(a, k, "authorization")
+            if a["from_user_id"] not in users or a["to_user_id"] not in users \
+                    or a.get("status") not in AUTH_STATUSES or a.get("visibility") not in VISIBILITIES \
+                    or as_integral(a.get("amount")) is None or as_integral(a.get("captured_amount")) is None \
+                    or not isinstance(a.get("payment_ids"), list) or not isinstance(a.get("seq"), int):
+                bad("authorization invalid")
+            if a["status"] == "open":
+                holds[a["from_user_id"]] = holds.get(a["from_user_id"], 0) + a["amount"] - a["captured_amount"]
+        for uid, h in holds.items():
+            if h > users[uid]["balance"]:
+                bad("holds exceed balance")
     except KeyError:
         bad("state is missing fields")
     return s
@@ -396,13 +472,14 @@ def payment_view(p):
         "note": p["note"],
         "visibility": p["visibility"],
         "request_id": p.get("request_id"),
+        "authorization_id": p.get("authorization_id"),
         "settlement_id": p.get("settlement_id"),
         "created_at": p["created_at"],
     }
 
 
 def make_payment(frm, to, amount, note, visibility, request_id=None,
-                 settlement_id=None, created_at=None):
+                 settlement_id=None, created_at=None, authorization_id=None):
     """Move money and record the payment. Caller holds LOCK and has checked funds."""
     st = STATE
     st["users"][frm["id"]]["balance"] -= amount
@@ -412,8 +489,8 @@ def make_payment(frm, to, amount, note, visibility, request_id=None,
         "id": next_id("p", "payment", lambda i: i in IDX["payments"]),
         "from_user_id": frm["id"], "to_user_id": to["id"], "amount": amount,
         "note": note, "visibility": visibility, "request_id": request_id,
-        "settlement_id": settlement_id, "created_at": created_at or now_iso(),
-        "seq": st["counters"]["seq"],
+        "settlement_id": settlement_id, "authorization_id": authorization_id,
+        "created_at": created_at or now_iso(), "seq": st["counters"]["seq"],
     }
     st["payments"].append(p)
     IDX["payments"][p["id"]] = p
@@ -484,6 +561,8 @@ def do_login(body):
 def do_me(user):
     return 200, {"user_id": user["id"], "display_name": user["display_name"],
                  "handle": user["handle"], "balance": user["balance"],
+                 "total": user["balance"], "available": available(user),
+                 "held": held_of(user["id"]),
                  "currency": STATE["currency"], "minor_units": STATE["minor_units"]}
 
 
@@ -499,7 +578,7 @@ def do_payment(user, body):
     to = user_by_handle(to_handle)
     if to is None:
         raise ApiError(404, "not_found", "no such handle")
-    if user["balance"] < amount:
+    if available(user) < amount:
         raise ApiError(409, "insufficient_funds")
     return payment_view(make_payment(user, to, amount, note, vis))
 
@@ -578,7 +657,7 @@ def do_pay(user, body, rid):
     vis = parse_visibility(body)
     if r["status"] != "pending":
         raise ApiError(409, "request_not_pending")
-    if user["balance"] < r["amount"]:
+    if available(user) < r["amount"]:
         raise ApiError(409, "insufficient_funds")
     requester = STATE["users"][r["requester_id"]]
     p = make_payment(user, requester, r["amount"], r["note"], vis, request_id=r["id"])
@@ -693,7 +772,7 @@ def do_settlement(user, body):
         net[frm["id"]] = net.get(frm["id"], 0) - amount
         net[to["id"]] = net.get(to["id"], 0) + amount
     for uid, delta in net.items():
-        if STATE["users"][uid]["balance"] + delta < 0:
+        if available(STATE["users"][uid]) + delta < 0:
             raise ApiError(409, "insufficient_funds", "settlement is not affordable")
     st = STATE
     committed = now_iso()
@@ -706,6 +785,154 @@ def do_settlement(user, body):
             "payments": [payment_view(p) for p in payments]}
 
 
+def sweep():
+    """Expire open authorizations whose deadline has passed (lazy, on every request)."""
+    now = datetime.now(timezone.utc)
+    for a in STATE["authorizations"].values():
+        if a["status"] == "open" and datetime.fromisoformat(a["expires_at"]) <= now:
+            a["status"] = "expired"
+
+
+def remaining_of(a):
+    return a["amount"] - a["captured_amount"] if a["status"] == "open" else 0
+
+
+def held_of(uid):
+    return sum(remaining_of(a) for a in STATE["authorizations"].values()
+               if a["from_user_id"] == uid)
+
+
+def available(user):
+    return user["balance"] - held_of(user["id"])
+
+
+def authorization_view(a):
+    users = STATE["users"]
+    pids = a["payment_ids"]
+    return {
+        "authorization_id": a["id"],
+        "from_user_id": a["from_user_id"],
+        "from_handle": users[a["from_user_id"]]["handle"],
+        "to_user_id": a["to_user_id"],
+        "to_handle": users[a["to_user_id"]]["handle"],
+        "amount": a["amount"],
+        "captured_amount": a["captured_amount"],
+        "remaining_amount": remaining_of(a),
+        "currency": STATE["currency"],
+        "note": a["note"],
+        "visibility": a["visibility"],
+        "status": a["status"],
+        "expires_at": a["expires_at"],
+        "payment_id": pids[-1] if pids else None,
+        "payment_ids": list(pids),
+        "created_at": a["created_at"],
+    }
+
+
+def do_authorize(user, body):
+    to_handle = require_str(body, "to_handle")
+    if "amount" not in body:
+        bad("amount is required")
+    amount = parse_amount(body["amount"])
+    note = parse_note(body)
+    vis = parse_visibility(body)
+    if to_handle == user["handle"]:
+        raise ApiError(422, "self_payment", "cannot authorize yourself")
+    to = user_by_handle(to_handle)
+    if to is None:
+        raise ApiError(404, "not_found", "no such handle")
+    if available(user) < amount:
+        raise ApiError(409, "insufficient_funds")
+    st = STATE
+    st["counters"]["seq"] += 1
+    created = datetime.now(timezone.utc).replace(microsecond=0)
+    a = {
+        "id": next_id("a", "authorization", lambda i: i in st["authorizations"]),
+        "from_user_id": user["id"], "to_user_id": to["id"], "amount": amount,
+        "captured_amount": 0, "note": note, "visibility": vis, "status": "open",
+        "expires_at": now_iso(created + timedelta(seconds=st["ttl"])),
+        "payment_ids": [], "created_at": now_iso(created), "seq": st["counters"]["seq"],
+    }
+    st["authorizations"][a["id"]] = a
+    return authorization_view(a)
+
+
+def get_auth_for(aid):
+    a = STATE["authorizations"].get(aid)
+    if a is None:
+        raise ApiError(404, "not_found", "no such authorization")
+    return a
+
+
+def do_capture(user, body, aid):
+    a = get_auth_for(aid)
+    if a["to_user_id"] != user["id"]:
+        raise ApiError(403, "forbidden", "only the receiver may capture")
+    amount = None
+    if "amount" in body:
+        amount = as_integral(body["amount"])
+        if amount is None or amount < 1:
+            bad("amount must be a positive integer")
+    final = body.get("final", True)
+    if not isinstance(final, bool):
+        raise ApiError(400, "malformed_request", "final must be a boolean")
+    if a["status"] == "expired":
+        raise ApiError(409, "authorization_expired")
+    if a["status"] != "open":
+        raise ApiError(409, "authorization_not_open")
+    remaining = remaining_of(a)
+    if amount is None:
+        amount = remaining
+    if amount > remaining:
+        raise ApiError(422, "capture_exceeds_authorization", "amount exceeds the remaining hold")
+    frm, to = STATE["users"][a["from_user_id"]], STATE["users"][a["to_user_id"]]
+    p = make_payment(frm, to, amount, a["note"], a["visibility"], authorization_id=a["id"])
+    a["captured_amount"] += amount
+    a["payment_ids"].append(p["id"])
+    if final or a["captured_amount"] >= a["amount"]:
+        a["status"] = "captured"
+    return payment_view(p)
+
+
+def do_void(user, aid):
+    a = get_auth_for(aid)
+    if a["from_user_id"] != user["id"]:
+        raise ApiError(403, "forbidden", "only the payer may void")
+    if a["status"] == "voided":
+        return 200, authorization_view(a)
+    if a["status"] != "open":
+        raise ApiError(409, "authorization_not_open")
+    a["status"] = "voided"
+    return 200, authorization_view(a)
+
+
+def do_authorizations(user, query):
+    limit, offset = parse_paging(query)
+    direction = (query.get("direction") or [None])[-1]
+    status = (query.get("status") or [None])[-1]
+    if direction is not None and direction not in ("incoming", "outgoing"):
+        bad("unknown direction")
+    if status is not None and status not in AUTH_STATUSES:
+        bad("unknown status")
+    uid = user["id"]
+    out, skipped = [], 0
+    for a in sorted(STATE["authorizations"].values(), key=lambda x: x["seq"], reverse=True):
+        mine_out, mine_in = a["from_user_id"] == uid, a["to_user_id"] == uid
+        if direction == "outgoing" and not mine_out:
+            continue
+        if direction == "incoming" and not mine_in:
+            continue
+        if not (mine_in or mine_out) or (status and a["status"] != status):
+            continue
+        if skipped < offset:
+            skipped += 1
+            continue
+        out.append(authorization_view(a))
+        if len(out) > limit:
+            break
+    return 200, {"authorizations": out[:limit], "has_more": len(out) > limit}
+
+
 # ---------------------------------------------------------------- http
 
 # (method, path) -> (needs idempotency, handler(user, body))
@@ -714,8 +941,19 @@ IDEMPOTENT_ROUTES = {
     ("POST", "/requests"): do_request,
     ("POST", "/splits"): do_split,
     ("POST", "/settlements"): do_settlement,
+    ("POST", "/authorizations"): do_authorize,
 }
 REQ_ACTION_RE = re.compile(r"^/requests/([^/]+)/(pay|decline|cancel)$")
+AUTH_ACTION_RE = re.compile(r"^/authorizations/([^/]+)/(capture|void)$")
+UI_PATHS = ("/", "/requests", "/split", "/signup", "/login", "/authorizations")
+
+
+def render_page(path):
+    """Placeholder shell; the real screens arrive with the UI work item."""
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<title>Pocketful</title></head><body><main id=\"app\" data-route=\"%s\">"
+            "Pocketful</main></body></html>" % path)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -734,6 +972,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if body and self.command != "HEAD":
+            self.wfile.write(body)
+
+    def send_html(self, html):
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
             self.wfile.write(body)
 
     def send_error_body(self, e):
@@ -773,6 +1020,7 @@ class Handler(BaseHTTPRequestHandler):
         parts = h.split(" ")
         if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
             raise ApiError(401, "unauthenticated", "missing or malformed bearer token")
+        sweep()
         uid = STATE["tokens"].get(parts[1])
         if uid is None or uid not in STATE["users"]:
             raise ApiError(401, "unauthenticated", "unknown token")
@@ -824,8 +1072,21 @@ class Handler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/auth/login":
             return self.send_json(*do_login(self.obj(raw)))
 
+        if method == "GET" and path in UI_PATHS and (
+                path == "/" or "text/html" in (self.headers.get("Accept") or "").lower()):
+            return self.send_html(render_page(path))
         route = (method, path)
         handler = IDEMPOTENT_ROUTES.get(route)
+        am = AUTH_ACTION_RE.match(path) if method == "POST" else None
+        if am:
+            aid, action = am.group(1), am.group(2)
+            if action == "capture":
+                handler = lambda user, body, _aid=aid: do_capture(user, body, _aid)
+            else:
+                with LOCK:
+                    user = self.authenticate()
+                    result = do_void(user, aid)
+                return self.send_json(*result)
         m = REQ_ACTION_RE.match(path) if method == "POST" else None
         if m:
             rid, action = m.group(1), m.group(2)
@@ -837,7 +1098,8 @@ class Handler(BaseHTTPRequestHandler):
                     result = do_decline_cancel(user, rid, action)
                 return self.send_json(*result)
         known = handler is not None or route in (
-            ("GET", "/me"), ("GET", "/activity"), ("GET", "/requests"))
+            ("GET", "/me"), ("GET", "/activity"), ("GET", "/requests"),
+            ("GET", "/authorizations"))
         if not known:
             raise ApiError(404, "not_found", "no such route")
 
@@ -849,7 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
                 key = self.headers.get("Idempotency-Key")
                 if key is None or key == "":
                     raise ApiError(400, "missing_idempotency_key", "Idempotency-Key header required")
-                body = self.parse_json(raw, allow_empty=path.endswith("/pay"))
+                body = self.parse_json(raw, allow_empty=path.endswith(("/pay", "/capture")))
                 if not isinstance(body, dict):
                     raise ApiError(400, "malformed_request", "body must be a JSON object")
                 if len(key) > 255:
@@ -864,6 +1126,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = do_me(user)
             elif route == ("GET", "/requests"):
                 result = do_requests(user, query)
+            elif route == ("GET", "/authorizations"):
+                result = do_authorizations(user, query)
             else:
                 result = do_activity(user, query)
         return self.send_json(*result)
