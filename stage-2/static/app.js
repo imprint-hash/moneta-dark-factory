@@ -167,6 +167,32 @@
     return map[code] || msg || 'Something went wrong (' + r.status + ').';
   }
 
+  // Keyed list reconciliation: rows whose data is unchanged are kept as-is (so typing,
+  // focus and selections inside them are never disturbed by a background refresh).
+  function reconcile(listEl, items, keyOf, build) {
+    const cache = listEl._rows || (listEl._rows = new Map());
+    const active = document.activeElement;
+    const focusId = active && listEl.contains(active) ? active.id : null;
+    const sel = focusId && active.selectionStart != null ? [active.selectionStart, active.selectionEnd] : null;
+    const seen = new Set();
+    const nodes = items.map((it) => {
+      const k = keyOf(it), sig = JSON.stringify(it);
+      seen.add(k);
+      const hit = cache.get(k);
+      if (hit && hit.sig === sig) return hit.node;
+      const node = build(it);
+      cache.set(k, { sig, node });
+      return node;
+    });
+    for (const k of [...cache.keys()]) if (!seen.has(k)) cache.delete(k);
+    nodes.forEach((n, i) => { if (listEl.children[i] !== n) listEl.insertBefore(n, listEl.children[i] || null); });
+    while (listEl.children.length > nodes.length) listEl.lastElementChild.remove();
+    if (focusId && document.activeElement && document.activeElement.id !== focusId) {
+      const again = document.getElementById(focusId);
+      if (again) { again.focus({ preventScroll: true }); if (sel) try { again.setSelectionRange(sel[0], sel[1]); } catch (e) { /* not a text field */ } }
+    }
+  }
+
   // ------------------------------------------------------------------ state boxes
   function stateBox(kind, text, tid, extra) {
     const ic = { refused: '✕', sent: '✓', uncertain: '?', loading: '' }[kind];
@@ -426,6 +452,7 @@
     shell(h('div', { class: 'stack' }, h('h1', { class: 'page-title', text: 'Requests' }), err.el, loading, emptyBox, inSec, outSec));
     inSec.hidden = outSec.hidden = true;
     let seq = 0;
+    const rowState = {};
 
     function row(r, dir) {
       const id = r.request_id;
@@ -434,6 +461,8 @@
       const ctl = [];
       if (r.status === 'pending' && dir === 'in') {
         const vis = h('select', { id: 'rv-' + id, 'aria-label': 'Visibility' }, h('option', { value: 'public', text: 'Public' }), h('option', { value: 'private', text: 'Private' }));
+        vis.value = rowState['rv-' + id] || 'public';
+        vis.addEventListener('change', () => { rowState['rv-' + id] = vis.value; });
         ctl.push(h('div', { class: 'field' }, h('label', { for: 'rv-' + id, text: 'Visibility when paid' }), vis));
         ctl.push(h('button', { class: 'btn small', type: 'button', tid: 'request-pay-' + id, onclick: (e) => act(e.currentTarget, 'pay', r, vis.value) }, 'Pay ' + money(r.amount)));
         ctl.push(h('button', { class: 'btn small secondary', type: 'button', tid: 'request-decline-' + id, onclick: (e) => act(e.currentTarget, 'decline', r) }, 'Decline'));
@@ -456,13 +485,14 @@
         const [a, b] = await Promise.all([call('GET', '/requests?direction=incoming&limit=200'), call('GET', '/requests?direction=outgoing&limit=200')]);
         if (mine !== seq || !a.ok || !b.ok) return;
         loading.remove();
-        incoming.replaceChildren(...a.data.requests.map((r) => row(r, 'in')));
-        outgoing.replaceChildren(...b.data.requests.map((r) => row(r, 'out')));
+        reconcile(incoming, a.data.requests, (r) => r.request_id, (r) => row(r, 'in'));
+        reconcile(outgoing, b.data.requests, (r) => r.request_id, (r) => row(r, 'out'));
         const none = !a.data.requests.length && !b.data.requests.length;
         inSec.hidden = outSec.hidden = none;
         emptyBox.replaceChildren(none ? h('div', { class: 'empty', tid: 'empty-requests' }, h('b', { text: 'No requests' }), 'When someone asks you for money, or you ask them, it shows up here.') : '');
-        if (!a.data.requests.length && !none) incoming.replaceChildren(h('li', { class: 'muted', text: 'Nothing waiting for you.' }));
-        if (!b.data.requests.length && !none) outgoing.replaceChildren(h('li', { class: 'muted', text: 'You haven’t asked anyone.' }));
+        [incoming, outgoing].forEach((l) => { const n = l.nextElementSibling; if (n && n.classList.contains('none-note')) n.remove(); });
+        if (!a.data.requests.length && !none) incoming.after(h('p', { class: 'muted none-note', text: 'Nothing waiting for you.' }));
+        if (!b.data.requests.length && !none) outgoing.after(h('p', { class: 'muted none-note', text: 'You haven\u2019t asked anyone.' }));
       } catch (e) { /* keep last view */ }
     }
     async function act(button, action, r, vis) {
@@ -477,6 +507,7 @@
       } catch (e) {
         err.set('uncertain', 'We couldn’t confirm what happened. Refresh to check, then try again.', 'request-uncertain');
       }
+      button.disabled = false;
       await load();
     }
     await load();
@@ -560,19 +591,26 @@
         paintList(a.data.authorizations);
       } catch (e) { /* keep */ }
     }
+    const listUl = h('ul', { class: 'list', tid: 'authorization-list' });
+    const capState = {};
     function paintList(items) {
       if (!items.length) {
         listBox.replaceChildren(h('div', { class: 'empty', tid: 'empty-authorizations' }, h('b', { text: 'No reservations' }), 'Reserve money for someone to collect later, or collect what others reserved for you.'));
         return;
       }
-      listBox.replaceChildren(h('ul', { class: 'list', tid: 'authorization-list' }, items.map((a) => {
+      if (!listUl.isConnected) listBox.replaceChildren(listUl);
+      reconcile(listUl, items, (a) => a.authorization_id, (a) => {
         const id = a.authorization_id;
         const incoming = a.to_user_id === ME.user_id;
         const other = incoming ? a.from_handle : a.to_handle;
         const ctl = [];
         if (a.status === 'open' && incoming) {
-          const ci = h('input', { id: 'cap-' + id, tid: 'authorization-capture-amount-' + id, inputmode: 'decimal', value: decimalText(a.remaining_amount), autocomplete: 'off' });
+          const cs = capState[id] || (capState[id] = { dirty: false, value: '', keep: false });
+          const ci = h('input', { id: 'cap-' + id, tid: 'authorization-capture-amount-' + id, inputmode: 'decimal', value: cs.dirty ? cs.value : decimalText(a.remaining_amount), autocomplete: 'off' });
+          ci.addEventListener('input', () => { cs.dirty = true; cs.value = ci.value; });
           const keep = h('input', { id: 'keep-' + id, type: 'checkbox', style: 'width:20px;min-height:20px;flex:none' });
+          keep.checked = cs.keep;
+          keep.addEventListener('change', () => { cs.keep = keep.checked; });
           ctl.push(field('cap-' + id, 'Amount to collect', ci));
           ctl.push(h('div', { class: 'field', style: 'flex:1 1 100%;display:flex;flex-direction:row;align-items:center;gap:8px' }, keep, h('label', { for: 'keep-' + id, text: 'Keep the rest on hold' })));
           ctl.push(h('button', { class: 'btn small', type: 'button', tid: 'authorization-capture-' + id, onclick: (e) => capture(e.currentTarget, a, ci, keep) }, 'Collect'));
@@ -593,7 +631,7 @@
             h('div', { class: 'meta' }, h('span', { class: 'friendly', text: friendlyExpiry(a) }), h('span', { class: 'tiny' }, h('time', { tid: 'authorization-expires-' + id, datetime: a.expires_at, text: a.expires_at })))),
           h('div', { class: 'amt ' + (incoming ? 'in' : 'out') }, h('span', { tid: 'authorization-amount-' + id, text: money(a.amount) })),
           ctl.length ? h('div', { class: 'actions' }, ctl) : null);
-      })));
+      });
     }
     async function capture(button, a, input, keep) {
       err.clear();
@@ -604,11 +642,13 @@
       button.disabled = true;
       try {
         const r = await call('POST', '/authorizations/' + a.authorization_id + '/capture', { body, key: keyFor('cap-' + a.authorization_id, JSON.stringify(body)) });
+        if (r.ok) delete capState[a.authorization_id];
         if (r.ok) err.set('sent', 'Collected ' + money(amt.minor) + ' from @' + a.from_handle + '.', 'authorization-success');
         else err.set('refused', errText(r), 'authorization-error');
       } catch (e) {
         err.set('uncertain', 'We couldn’t confirm the collection. Press Collect again to retry safely.', 'authorization-uncertain');
       }
+      button.disabled = false;
       await load();
     }
     async function voidIt(button, a) {
@@ -621,6 +661,7 @@
       } catch (e) {
         err.set('uncertain', 'We couldn’t confirm the release. Refresh to check.', 'authorization-uncertain');
       }
+      button.disabled = false;
       await load();
     }
     const form = moneyForm(authorizeCfg(), load);
