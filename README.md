@@ -4,9 +4,6 @@
 
 WeAreDevelopers x BAND "Dark Factory" hackathon · **Track: pocketful** · **Stages: 1 and 2**
 
-Moneta is named after the Roman goddess whose temple housed the mint: the words *money*
-and *mint* both come from her name.
-
 One human message started the run. Four AI seats then planned, built, examined and used
 the product on their own, and every stage was accepted only when two independent reviewers
 passed the same commit.
