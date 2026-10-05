@@ -1,0 +1,22 @@
+{
+  "track": "pocketful",
+  "folders": {
+    "1": {
+      "claimed": true,
+      "share": 1.0,
+      "overshoot": null,
+      "highest_contiguous": 1,
+      "report": "stage-1/report.json"
+    },
+    "2": {
+      "claimed": true,
+      "share": 1.0,
+      "overshoot": null,
+      "highest_contiguous": 2,
+      "report": "stage-2/report.json"
+    }
+  },
+  "run_id": "final-judge-1454",
+  "mode": "isolated",
+  "preview": true
+}

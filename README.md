@@ -35,6 +35,24 @@ own work and every stage is accepted only on independent evidence:
 - **Everything is on the record:** each seat commits under its own name, and the whole
   conversation is in `room.json`.
 
+## What the app does
+
+The factory built a calm, dark consumer money app, on phone and desktop:
+
+- **Split a bill with friends.** Enter what you paid and your friends' handles; every
+  friend's share appears live, with their initials, before anything is sent. Each friend
+  then gets a request for exactly their share, down to the last cent, and the extra cent
+  goes to the first people listed.
+- **Send money by handle**, public or private, and see it in an activity feed.
+- **Request money**, and pay, decline or cancel requests.
+- **Hold and capture:** reserve funds, then capture part or all of them, or release them.
+  Available funds are always the biggest number on screen.
+- **Never pay twice.** If the connection drops after you press send, the app says it cannot
+  be sure the payment went through and lets you retry safely; the retry can only move the
+  money once.
+
+![Split a bill: every share shown before you send](evidence/guest-stage-2/d-split-preview.png)
+
 ## What it caught
 
 In stage 2 the examiner found a real money bug: after a refused capture of a hold, a
@@ -76,6 +94,9 @@ Then open http://localhost:8080 (stage 2) or `curl localhost:8080/health`.
 | [`FACTORY.md`](FACTORY.md) | The factory in full: design choices, what it caught, cost and time, what stopped it, how to stand it up |
 | [`mandates/`](mandates/) | One generic mandate per seat, each naming its harness and model |
 | `room.json` | The full Band room the factory worked in, downloaded unchanged |
+| [`dispatch/`](dispatch/) | The task file the one human message pointed to, unchanged |
+| [`verification/`](verification/) | BAND's harness reports from an isolated run on a fresh clone |
+| [`evidence/guest-stage-2/`](evidence/guest-stage-2/) | The guest's screenshots from its phone and desktop review of stage 2 |
 | [`stage-1/`](stage-1/), [`stage-2/`](stage-2/) | The services the factory built, one complete folder per stage |
 | [`ledger/`](ledger/) | The lead's requirement ledger per stage, written before any code |
 | [`exam/`](exam/) | The examiner's black-box exams, committed after each stage was accepted |
