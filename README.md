@@ -85,7 +85,7 @@ Each stage folder is a complete service. From inside it:
 docker build -t moneta-stage2 . && docker run --rm -p 8080:8080 -e PORT=8080 moneta-stage2
 ```
 
-Then open http://localhost:8080 (stage 2) or `curl localhost:8080/health`.
+Once it is running on your machine, open `localhost:8080` in a browser to use the stage-2 app, or run `curl localhost:8080/health`. The app is not hosted online; judges and readers build it from its folder with Docker.
 
 ## How to read this repository
 
